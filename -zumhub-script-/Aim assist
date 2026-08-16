@@ -1,0 +1,208 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- helpers
+
+local function getCenter()
+	return camera.ViewportSize / 2
+end
+
+local function isAlive(char)
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	return hum and hum.Health > 0
+end
+
+local function sameTeam(other)
+	if not config.teamCheck then return false end
+	return player.Team ~= nil and player.Team == other.Team
+end
+
+local function ignored(other)
+	for _, name in ipairs(config.ignoreList) do
+		if other.Name:lower() == name:lower() then return true end
+	end
+	return false
+end
+
+local function toScreen(part)
+	local pos, onScreen = camera:WorldToViewportPoint(part.Position)
+	return Vector2.new(pos.X, pos.Y), onScreen, pos.Z
+end
+
+local function wallClear(part)
+	if not config.wallCheck then return true end
+
+	local char = player.Character
+	local exclude = { part, camera }
+	if char then table.insert(exclude, char) end
+	for _, v in ipairs(config.wallCheckParts) do table.insert(exclude, v) end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = exclude
+
+	local dir = part.Position - camera.CFrame.Position
+	local hit = workspace:Raycast(camera.CFrame.Position, dir, params)
+	return hit == nil
+end
+
+local function predictedPos(part)
+	if not config.predictionEnabled then return part.Position end
+	local vel = part.AssemblyLinearVelocity or Vector3.zero
+	return part.Position + vel * config.predictionFactor
+end
+
+local function aimPos(part)
+	return predictedPos(part) + Vector3.new(0, config.verticalOffset, 0)
+end
+
+local function score(part, screenPos, worldDist)
+	if config.priorityMode == "distance" then return worldDist end
+	return (screenPos - getCenter()).Magnitude
+end
+
+-- target finding
+
+local function candidates()
+	local list = {}
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other == player or sameTeam(other) or ignored(other) then continue end
+		local char = other.Character
+		if char and isAlive(char) then table.insert(list, char) end
+	end
+
+	if config.npcTargeting then
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			if obj:IsA("Humanoid") and obj.Health > 0 then
+				local char = obj.Parent
+				if char and not Players:GetPlayerFromCharacter(char) then
+					table.insert(list, char)
+				end
+			end
+		end
+	end
+
+	return list
+end
+
+local function findTarget()
+	local center = getCenter()
+	local best, bestScore = nil, math.huge
+
+	for _, char in ipairs(candidates()) do
+		local part = char:FindFirstChild(config.targetPart) or char:FindFirstChild("HumanoidRootPart")
+		if not part then continue end
+
+		local screenPos, onScreen = toScreen(part)
+		if not onScreen then continue end
+
+		local worldDist = (camera.CFrame.Position - part.Position).Magnitude
+		if config.maxDistance > 0 and worldDist > config.maxDistance then continue end
+		if (screenPos - center).Magnitude > config.fovRadius then continue end
+		if not wallClear(part) then continue end
+
+		local s = score(part, screenPos, worldDist)
+		if s < bestScore then
+			bestScore = s
+			best = part
+		end
+	end
+
+	return best
+end
+
+-- input: desktop
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe or isMobile then return end
+	if input.UserInputType ~= config.triggerButton then return end
+	if config.toggleMode then toggled = not toggled else active = true end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if isMobile then return end
+	if input.UserInputType ~= config.triggerButton then return end
+	if not config.toggleMode then active = false end
+end)
+
+-- input: mobile
+
+if isMobile then
+	UserInputService.TouchStarted:Connect(function(touch, gpe)
+		if gpe then return end
+		touchCount += 1
+
+		if config.mobileToggle and touchCount >= config.mobileTriggerFingers then
+			toggled = not toggled
+		end
+	end)
+
+	UserInputService.TouchEnded:Connect(function()
+		touchCount = math.max(0, touchCount - 1)
+		if not config.mobileToggle and touchCount < config.mobileTriggerFingers then
+			active = false
+		end
+	end)
+
+	if not config.mobileToggle then
+		UserInputService.TouchStarted:Connect(function(touch, gpe)
+			if gpe then return end
+			if touchCount >= config.mobileTriggerFingers then
+				active = true
+			end
+		end)
+	end
+end
+
+local function isActive()
+	if not config.requireHolding then return true end
+	return config.toggleMode and toggled
+		or (isMobile and config.mobileToggle and toggled)
+		or active
+end
+
+-- main loop
+
+RunService.RenderStepped:Connect(function()
+	if fovCircle then
+		fovCircle.Position = getCenter()
+		fovCircle.Radius = config.fovRadius
+	end
+
+	if not isActive() then
+		if currentTween then currentTween:Cancel() currentTween = nil end
+		return
+	end
+
+	local target = findTarget()
+	if not target then return end
+
+	local goal = CFrame.lookAt(camera.CFrame.Position, aimPos(target))
+
+	if config.smoothMode == "tween" then
+		if currentTween then currentTween:Cancel() end
+		local info = TweenInfo.new(config.tweenTime, config.tweenStyle, config.tweenDir)
+		currentTween = TweenService:Create(camera, info, { CFrame = goal })
+		currentTween:Play()
+	else
+		local factor = config.smoothing
+
+		if config.stickyAim then
+			local sp = toScreen(target)
+			local d = (sp - getCenter()).Magnitude
+			if d < config.stickyRadius then
+				local t = 1 - d / config.stickyRadius
+				factor = factor * (1 - t * config.stickyStrength)
+			end
+		end
+
+		camera.CFrame = camera.CFrame:Lerp(goal, factor)
+	end
+end)
